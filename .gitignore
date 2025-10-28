@@ -1,0 +1,24 @@
+# virtual envs
+.venv311/
+.venv/
+venv/
+env/
+
+# python build junk
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# native artifacts
+*.so
+*.dylib
+*.dll
+
+# editors & OS
+.vscode/
+.idea/
+.DS_Store
+*.log
