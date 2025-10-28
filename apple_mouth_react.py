@@ -79,15 +79,18 @@ def mouth_metrics(frame, lm, w, h):
     return mar, corner_drop, inner
 
 def red_tongue(inner_bgr):
-    if inner_bgr is None or inner_bgr.size == 0: return False, 0.0
+    if inner_bgr is None or inner_bgr.size == 0:
+        return False, 0.0
     hsv = cv2.cvtColor(inner_bgr, cv2.COLOR_BGR2HSV)
-    hsv[...,2] = cv2.equalizeHist(hsv[...,2])  # stabilize lighting
+    hsv[...,2] = cv2.equalizeHist(hsv[...,2])
+
     m1 = cv2.inRange(hsv, (0, 90, 60), (12, 255, 255))
     m2 = cv2.inRange(hsv, (165, 90, 60), (180, 255, 255))
     mask = cv2.bitwise_or(m1, m2)
-    kernel = np.ones((3,3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, 1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
+
+    k = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, 1)
 
     cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts: return False, 0.0
@@ -95,8 +98,9 @@ def red_tongue(inner_bgr):
     largest = max(areas)
     frac_largest = largest / float(mask.shape[0]*mask.shape[1])
     frac_overall = float(cv2.countNonZero(mask)) / mask.size
-    # require one solid tongue-like blob, not just red lips
-    return (frac_largest > 0.15 and frac_overall > 0.22), frac_overall
+    # also require strong saturation so red lips don’t trigger
+    sat_mean = cv2.mean(hsv[...,1], mask=mask)[0]
+    return (frac_largest > 0.18 and frac_overall > 0.24 and sat_mean > 90), frac_overall
 
 # eyebrow groups via mesh constants
 def eyebrow_groups(lm, w, h):
@@ -131,48 +135,93 @@ def brow_signals(lm, w, h, ipd):
     inter_inner = np.hypot(*(Lc - Rc)) / ipd
     return inner_raise, gap, inter_inner
 
+# Nose set for bbox/metrics
+def idx_set(conns):
+    s = set()
+    for a, b in conns: s.add(a); s.add(b)
+    return sorted(s)
+
+NOSE = idx_set(mpfm.FACEMESH_NOSE)  # new
+
+def nose_metrics(lm, w, h, ipd):
+    # bbox of nose region
+    pts = np.array([(int(lm[i].x*w), int(lm[i].y*h)) for i in NOSE])
+    x1, y1 = pts[:,0].min(), pts[:,1].min()
+    x2, y2 = pts[:,0].max(), pts[:,1].max()
+    nose_w = (x2 - x1) / max(ipd, 1.0)    # nostril flare proxy
+
+    # philtrum = distance from nose base to upper lip center
+    U = int(lm[UPPER_CENTER].y * h)        # inner upper lip landmark (13)
+    nose_base_y = y2                       # bottom of nose bbox
+    philtrum = (nose_base_y - U) / max(ipd, 1.0)
+
+    return philtrum, nose_w
+
+
 # ---------- calibration ----------
 class Calib:
     def __init__(self):
         self.ready = False
-        self.mars, self.ears = deque(maxlen=90), deque(maxlen=90)
-        self.gaps, self.irs, self.iis = deque(maxlen=90), deque(maxlen=90), deque(maxlen=90)
+        self.mars = deque(maxlen=90)
+        self.ears = deque(maxlen=90)
+        self.gaps = deque(maxlen=90)
+        self.inner_raise = deque(maxlen=90)
+        self.inter_inner = deque(maxlen=90)
+        self.phils = deque(maxlen=90)      # NEW
+        self.noses = deque(maxlen=90)      # NEW
 
-    def push(self, mar, ear, gap, ir, ii):
-        self.mars.append(mar); self.ears.append(ear)
-        self.gaps.append(gap); self.irs.append(ir); self.iis.append(ii)
+    def push(self, mar, ear, gap, ir, ii, phil=None, nosew=None):
+        self.mars.append(mar)
+        self.ears.append(ear)
+        self.gaps.append(gap)
+        self.inner_raise.append(ir)
+        self.inter_inner.append(ii)
+        if phil is not None: self.phils.append(phil)
+        if nosew is not None: self.noses.append(nosew)
 
     def finalize(self):
         if len(self.mars) < 30: return False
         self.MAR0 = float(np.median(self.mars))
         self.EAR0 = float(np.median(self.ears))
         self.GAP0 = float(np.median(self.gaps))
-        self.IR0  = float(np.median(self.irs))
-        self.II0  = float(np.median(self.iis))
-        self.ready = True; return True
+        self.IR0  = float(np.median(self.inner_raise))
+        self.II0  = float(np.median(self.inter_inner))
+        # NEW baselines
+        self.PHIL0 = float(np.median(self.phils)) if self.phils else 0.10
+        self.NOSE0 = float(np.median(self.noses)) if self.noses else 0.35
+        self.ready = True
+        return True
 
 # Tuning knobs (relative to your neutral)
-MOUTH_OPEN_DELTA   = 0.02   # open beyond neutral
-MOUTH_BIG_DELTA    = 0.24   # very open (shock)
-EYES_WIDE_DELTA    = 0.05   # brows up can replace this
-BROWS_UP_DELTA     = 0.01   # shock uses gap increase
-BROWS_LOW_DELTA    = 0.06   # angry uses gap decrease
-BROWS_TOGETHER_DEL = 0.05   # angry: inner brow distance shrinks
-BROWS_INNER_DOWN   = 0.05   # angry: inner lower than outer
-CORNERS_DOWN_ABS   = 0.40   # cry: mouth corners down (absolute, robust)
+MOUTH_OPEN_DELTA   = 0.10
+MOUTH_BIG_DELTA    = 0.22
+EYES_WIDE_DELTA    = 0.05
+BROWS_UP_DELTA     = 0.06
+BROWS_LOW_DELTA    = 0.05
+BROWS_TOGETHER_DEL = 0.04
+BROWS_INNER_DOWN   = 0.04
+CORNERS_DOWN_ABS   = 0.40
+NOSE_SCRUNCH_PHIL_DEL = 0.03
+NOSE_SCRUNCH_NOST_DEL = 0.03
+
+
+
 
 def decide_state(frame, face, calib):
     h, w = frame.shape[:2]
     lm = face.landmark
 
     ear, ipd = eye_metrics(lm, w, h)
-    mar, corner_drop, inner = mouth_metrics(frame, lm, w, h)
+    mar, corner_drop, inner = mouth_metrics(frame, lm, w, h)  # capture corner_drop & inner
     ir, gap, ii = brow_signals(lm, w, h, ipd)
-    tongue, _ = red_tongue(inner)
+    phil, nosew = nose_metrics(lm, w, h, ipd)
+    tongue, _ = red_tongue(inner)  # detect tongue here
 
     if not calib.ready:
-        return "neutral", (mar, ear, gap, ir, ii)
+        # while calibrating we just pass metrics back for logging
+        return "neutral", (mar, ear, gap, ir, ii, phil, nosew)
 
+    # gates (relative to neutral baselines)
     mouth_open = mar > calib.MAR0 + MOUTH_OPEN_DELTA
     mouth_big  = mar > calib.MAR0 + MOUTH_BIG_DELTA
     eyes_wide  = ear > calib.EAR0 + EYES_WIDE_DELTA
@@ -181,17 +230,20 @@ def decide_state(frame, face, calib):
     brows_together = ii < calib.II0 - BROWS_TOGETHER_DEL
     inner_down = ir < calib.IR0 - BROWS_INNER_DOWN
     inner_up   = ir > calib.IR0 + BROWS_INNER_DOWN
+    scrunch = (phil < calib.PHIL0 - NOSE_SCRUNCH_PHIL_DEL) and \
+              (nosew > calib.NOSE0 + NOSE_SCRUNCH_NOST_DEL)
 
-    # priority order
-    if mouth_open and tongue:
-        return "tongue", (mar, ear, gap, ir, ii)
+    # priority: SHOCK before TONGUE
     if mouth_big and (brows_up or eyes_wide):
-        return "shock", (mar, ear, gap, ir, ii)
+        return "shock", (mar, ear, gap, ir, ii, phil, nosew)
+    if mouth_open and tongue and not (brows_up or eyes_wide):
+        return "tongue", (mar, ear, gap, ir, ii, phil, nosew)
     if (corner_drop > CORNERS_DOWN_ABS) and inner_up and not mouth_open:
-        return "cry", (mar, ear, gap, ir, ii)
-    if brows_low and brows_together and inner_down and not mouth_open:
-        return "angry", (mar, ear, gap, ir, ii)
-    return "neutral", (mar, ear, gap, ir, ii)
+        return "cry", (mar, ear, gap, ir, ii, phil, nosew)
+    if (brows_low and (brows_together or inner_down) and scrunch) \
+       and not mouth_open and not eyes_wide:
+        return "angry", (mar, ear, gap, ir, ii, phil, nosew)
+    return "neutral", (mar, ear, gap, ir, ii, phil, nosew)
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -220,15 +272,16 @@ def main():
                 ear, ipd = eye_metrics(lm, w, h)
                 mar, _, _ = mouth_metrics(frame, lm, w, h)
                 ir, gap, ii = brow_signals(lm, w, h, ipd)
-                calib.push(mar, ear, gap, ir, ii)
+                phil, nosew = nose_metrics(lm, w, h, ipd)  # NEW
+                calib.push(mar, ear, gap, ir, ii, phil, nosew)
                 if time.time() - t0 > 2.0 and calib.finalize():
                     print("Calibration done.")
             next_state, metrics = decide_state(frame, f, calib)
             # print metrics ~2x/sec to help tune (no overlay)
             log_every = (log_every + 1) % 15
             if log_every == 0 and calib.ready:
-                mar, ear, gap, ir, ii = metrics
-                print(f"STATE={next_state:7s} MAR={mar:.2f} EAR={ear:.2f} GAP={gap:.2f} IR={ir:.2f} II={ii:.2f}")
+                mar, ear, gap, ir, ii, phil, nosew = metrics
+                print(f"STATE={next_state:7s} MAR={mar:.2f} EAR={ear:.2f} GAP={gap:.2f} IR={ir:.2f} II={ii:.2f} PH={phil:.2f} NW={nosew:.2f}")
         else:
             next_state = "neutral"
 
