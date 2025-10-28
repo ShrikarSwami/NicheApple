@@ -70,21 +70,29 @@ def mouth_metrics(frame, lm, w, h):
     corner_drop = (corners_y - center_y) / float(mh)
 
     # inner mouth crop (tighter sides to exclude lips)
+    # inner mouth crop (wider & deeper so big tongues fit)
     x1, x2 = min(L[0], R[0]), max(L[0], R[0])
     y1, y2 = min(U[1], D[1]), max(U[1], D[1])
-    sx = int(x1 + 0.22*mw); ex = int(x2 - 0.22*mw)
-    sy = int(y1 + 0.27*mh); ey = int(y2 - 0.12*mh)
-    sx, sy = max(0, sx), max(0, sy); ex, ey = min(w-1, ex), min(h-1, ey)
+    sx = int(x1 + 0.18*mw)       # was 0.22
+    ex = int(x2 - 0.18*mw)       # was 0.22
+    sy = int(y1 + 0.22*mh)       # was 0.27
+    ey = int(y2 - 0.02*mh)       # was 0.12  (captures lower tongue)
+    sx, sy = max(0, sx), max(0, sy)
+    ex, ey = min(w-1, ex), min(h-1, ey)
     inner = frame[sy:ey, sx:ex].copy() if ex>sx and ey>sy else None
+
     return mar, corner_drop, inner
 
 def red_tongue(inner_bgr):
     if inner_bgr is None or inner_bgr.size == 0:
         return False, 0.0
+    # denoise a hair
+    inner_bgr = cv2.GaussianBlur(inner_bgr, (3,3), 0)
     hsv = cv2.cvtColor(inner_bgr, cv2.COLOR_BGR2HSV)
     hsv[...,2] = cv2.equalizeHist(hsv[...,2])
 
-    m1 = cv2.inRange(hsv, (0, 90, 60), (12, 255, 255))
+    # red mask
+    m1 = cv2.inRange(hsv, (0, 90, 60),  (12, 255, 255))
     m2 = cv2.inRange(hsv, (165, 90, 60), (180, 255, 255))
     mask = cv2.bitwise_or(m1, m2)
 
@@ -94,13 +102,22 @@ def red_tongue(inner_bgr):
 
     cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts: return False, 0.0
-    areas = [cv2.contourArea(c) for c in cnts]
-    largest = max(areas)
-    frac_largest = largest / float(mask.shape[0]*mask.shape[1])
-    frac_overall = float(cv2.countNonZero(mask)) / mask.size
-    # also require strong saturation so red lips don’t trigger
+
+    # largest red blob stats (size + where in mouth)
+    H, W = mask.shape[:2]
+    c = max(cnts, key=cv2.contourArea)
+    x,y,w,h = cv2.boundingRect(c)
+    area_largest = w*h
+    frac_largest = area_largest / float(H*W)
+    frac_overall = float(cv2.countNonZero(mask)) / (H*W)
+    height_ratio = h / float(H)             # tall tongue = big number
+    cy = y + h/2.0                          # vertical center of blob
+    below_mid = cy > (0.55*H)               # tongue sits in lower half
     sat_mean = cv2.mean(hsv[...,1], mask=mask)[0]
-    return (frac_largest > 0.18 and frac_overall > 0.24 and sat_mean > 90), frac_overall
+
+    ok = (frac_overall > 0.16 and frac_largest > 0.14 and
+          height_ratio > 0.30 and below_mid and sat_mean > 90)
+    return ok, frac_overall
 
 # eyebrow groups via mesh constants
 def eyebrow_groups(lm, w, h):
@@ -203,6 +220,8 @@ BROWS_INNER_DOWN   = 0.04
 CORNERS_DOWN_ABS   = 0.40
 NOSE_SCRUNCH_PHIL_DEL = 0.03
 NOSE_SCRUNCH_NOST_DEL = 0.03
+ANGRY_IR_EXTRA = 0.03   
+ANGRY_II_EXTRA = 0.06   
 
 
 
@@ -240,9 +259,9 @@ def decide_state(frame, face, calib):
         return "tongue", (mar, ear, gap, ir, ii, phil, nosew)
     if (corner_drop > CORNERS_DOWN_ABS) and inner_up and not mouth_open:
         return "cry", (mar, ear, gap, ir, ii, phil, nosew)
-    if (brows_low and (brows_together or inner_down) and scrunch) \
-       and not mouth_open and not eyes_wide:
-        return "angry", (mar, ear, gap, ir, ii, phil, nosew)
+    if (brows_low and not mouth_open and not eyes_wide):
+        if ( (brows_together or inner_down) and (scrunch or ir_low_enough or ii_small_enough) ):
+            return "angry", (mar, ear, gap, ir, ii, phil, nosew)
     return "neutral", (mar, ear, gap, ir, ii, phil, nosew)
 
 def main():
