@@ -19,7 +19,7 @@ assets/
   apple_shock.png
   apple_angry.png
   apple_cry.png
-# each 600x600 PNG, framed the same
+# each 1024x1024 PNG, framed the same
 
 python apple_face_states_clean.py
 
