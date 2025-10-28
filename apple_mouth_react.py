@@ -1,7 +1,8 @@
 # apple_mouth_react.py
-import cv2, numpy as np, mediapipe as mp, time
+import cv2, numpy as np, mediapipe as mp, time, os
 from collections import deque
 
+# ---- config ----
 SHOW_CAMERA_FEED = True
 APPLE_WINDOW_SIZE = 620
 LOG_EVERY = 15  # frames
@@ -10,9 +11,34 @@ ASSET_FILES = {
     "neutral": "assets/apple_neutral.png",
     "tongue":  "assets/apple_tongue.png",
     "shock":   "assets/apple_shock.png",
-    "angry":   "assets/apple_angry.png",   # not prioritized right now
+    "angry":   "assets/apple_angry.png",   # not prioritized now
     "cry":     "assets/apple_cry.png",
 }
+MUSIC_WAV = "assets/music_wink_start.wav"
+MUSIC_MP3 = "assets/music_wink_start.mp3"
+
+# ---------- camera helpers ----------
+PREF_BACKEND = cv2.CAP_AVFOUNDATION if hasattr(cv2, "CAP_AVFOUNDATION") else 0
+
+def open_cam(index: int):
+    cap = cv2.VideoCapture(index, PREF_BACKEND)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    return cap
+
+def cycle_camera(curr_index: int, step: int = 1, max_try: int = 6):
+    tried = set()
+    idx = curr_index
+    for _ in range(max_try):
+        idx = (idx + step) % max_try
+        if idx in tried:
+            continue
+        tried.add(idx)
+        cap = open_cam(idx)
+        if cap is not None:
+            return idx, cap
+    return None, None
 
 # ---------------- assets ----------------
 def load_png(path, label):
@@ -55,15 +81,16 @@ def xy(lm, i, w, h):
     p = lm[i]; return int(p.x*w), int(p.y*h)
 
 def eye_metrics(lm, w, h):
+    # per-eye normalized openings + averaged EAR
     lw = np.hypot(*(np.array(xy(lm, L_OUT, w, h)) - np.array(xy(lm, L_IN, w, h))))
     rw = np.hypot(*(np.array(xy(lm, R_OUT, w, h)) - np.array(xy(lm, R_IN, w, h))))
     l_open = abs(xy(lm, L_UP, w, h)[1]-xy(lm, L_DN, w, h)[1]) / max(lw, 1.0)
     r_open = abs(xy(lm, R_UP, w, h)[1]-xy(lm, R_DN, w, h)[1]) / max(rw, 1.0)
     ear = 0.5*(l_open + r_open)
     ipd = np.hypot(*(np.array(xy(lm, L_IN, w, h)) - np.array(xy(lm, R_IN, w, h))))
-    return ear, max(ipd, 1.0)
+    return l_open, r_open, ear, max(ipd, 1.0)
 
-# ---------- NEW: mouth boxes (returns 7 values) ----------
+# ---------- mouth boxes (returns 7 values) ----------
 def mouth_boxes(frame, lm, w, h):
     L = xy(lm, LEFT_CORNER, w, h); R = xy(lm, RIGHT_CORNER, w, h)
     U = xy(lm, UPPER_CENTER, w, h); D = xy(lm, LOWER_CENTER, w, h)
@@ -92,12 +119,8 @@ def mouth_boxes(frame, lm, w, h):
     # return: mar, corner_drop, inner, below-lip ROI, lower lip y, mouth w/h
     return mar, corner_drop, inner, below, D[1], mw, mh
 
-# ---------- NEW: tongue detector (focus on protrusion below lower lip) ----------
+# ---------- tongue detector (focus on protrusion below lower lip) ----------
 def has_tongue(inner_bgr, belowlip_bgr, lower_lip_y, mw, mh):
-    """
-    Detect a tall, saturated reddish blob that sits low and (usually) below the lower lip.
-    Returns (ok, score) where score is 0..1-ish for logs.
-    """
     def red_mask(bgr):
         if bgr is None or bgr.size == 0: return None, None
         bgr = cv2.GaussianBlur(bgr, (3,3), 0)
@@ -111,13 +134,11 @@ def has_tongue(inner_bgr, belowlip_bgr, lower_lip_y, mw, mh):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, 1)
         return mask, hsv
 
-    for roi_kind, roi in (("below", belowlip_bgr), ("inner", inner_bgr)):
+    for roi in (belowlip_bgr, inner_bgr):
         mask, hsv = red_mask(roi)
-        if mask is None: 
-            continue
+        if mask is None: continue
         nz = cv2.countNonZero(mask)
-        if nz == 0:
-            continue
+        if nz == 0: continue
 
         cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         c = max(cnts, key=cv2.contourArea)
@@ -133,7 +154,7 @@ def has_tongue(inner_bgr, belowlip_bgr, lower_lip_y, mw, mh):
         tall_enough  = height_ratio > 0.30
         sat_mean     = cv2.mean(hsv[...,1], mask=mask)[0]
 
-        # score for logs/tuning
+        # score for logs
         score = (
             0.35*min(frac_blob/0.18, 1.0) +
             0.25*min(height_ratio/0.38, 1.0) +
@@ -147,7 +168,7 @@ def has_tongue(inner_bgr, belowlip_bgr, lower_lip_y, mw, mh):
 
     return False, 0.0
 
-# ----- eyebrows / gap / together / slant -----
+# ----- eyebrows / gap / together -----
 def idx_set(conns):
     s = set()
     for a, b in conns: s.add(a); s.add(b)
@@ -183,17 +204,6 @@ def brow_signals(lm, w, h, ipd):
     inter_inner = np.hypot(*(Lc - Rc)) / ipd
     return inner_raise, gap, inter_inner
 
-# ----- nose scrunch (kept but not used for tongue-only focus) -----
-NOSE = idx_set(mpfm.FACEMESH_NOSE)
-def nose_metrics(lm, w, h, ipd):
-    pts = np.array([(int(lm[i].x*w), int(lm[i].y*h)) for i in NOSE])
-    x1, y1 = pts[:,0].min(), pts[:,1].min()
-    x2, y2 = pts[:,0].max(), pts[:,1].max()
-    nose_w = (x2 - x1) / max(ipd, 1.0)
-    U = int(lm[UPPER_CENTER].y * h)
-    philtrum = (y2 - U) / max(ipd, 1.0)
-    return philtrum, nose_w
-
 # ---------------- calibration ----------------
 class Calib:
     def __init__(self):
@@ -205,10 +215,17 @@ class Calib:
         self.inter_inner = deque(maxlen=90)
         self.phils = deque(maxlen=90)
         self.noses = deque(maxlen=90)
+        self.lopens = deque(maxlen=90)
+        self.ropens = deque(maxlen=90)
 
-    def push(self, mar, ear, gap, ir, ii, phil=None, nosew=None):
-        self.mars.append(mar); self.ears.append(ear); self.gaps.append(gap)
-        self.inner_raise.append(ir); self.inter_inner.append(ii)
+    def push(self, mar, l_open, r_open, ear, gap, ir, ii, phil=None, nosew=None):
+        self.mars.append(mar)
+        self.ears.append(ear)
+        self.gaps.append(gap)
+        self.inner_raise.append(ir)
+        self.inter_inner.append(ii)
+        self.lopens.append(l_open)
+        self.ropens.append(r_open)
         if phil is not None: self.phils.append(phil)
         if nosew is not None: self.noses.append(nosew)
 
@@ -219,6 +236,8 @@ class Calib:
         self.GAP0 = float(np.median(self.gaps))
         self.IR0  = float(np.median(self.inner_raise))
         self.II0  = float(np.median(self.inter_inner))
+        self.L0   = float(np.median(self.lopens))
+        self.R0   = float(np.median(self.ropens))
         self.PHIL0 = float(np.median(self.phils)) if self.phils else 0.10
         self.NOSE0 = float(np.median(self.noses)) if self.noses else 0.35
         self.ready = True
@@ -231,19 +250,55 @@ EYES_WIDE_DELTA    = 0.05
 BROWS_UP_DELTA     = 0.06
 CORNERS_DOWN_ABS   = 0.40
 
+# Wink heuristics: closed eye < 55% of baseline, other > 85% baseline
+WINK_CLOSE_RATIO   = 0.55
+WINK_OPEN_RATIO    = 0.85
+WINK_COOLDOWN_FR   = 20  # frames between triggers
+
+# ---------------- audio (pygame.mixer) ----------------
+_mixer_ok = False
+def audio_init():
+    global _mixer_ok
+    try:
+        import pygame
+        from pygame import mixer
+        pygame.mixer.init()  # just mixer, no window
+        _mixer_ok = True
+        # try WAV, then MP3 fallback
+        path = MUSIC_WAV if os.path.exists(MUSIC_WAV) else (MUSIC_MP3 if os.path.exists(MUSIC_MP3) else None)
+        if path:
+            pygame.mixer.music.load(path)
+        else:
+            print("Audio: no music file found. Add assets/music_wink_start.wav (preferred) or .mp3")
+    except Exception as e:
+        print(f"Audio init failed: {e}")
+        _mixer_ok = False
+
+def audio_play_once():
+    if not _mixer_ok:
+        return
+    try:
+        import pygame
+        if not pygame.mixer.music.get_busy():
+            pygame.mixer.music.play()  # play once
+    except Exception as e:
+        print(f"Audio play failed: {e}")
+
 # ---------------- decision (tongue first) ----------------
 def decide_state(frame, face, calib):
     h, w = frame.shape[:2]
     lm = face.landmark
 
-    ear, ipd = eye_metrics(lm, w, h)
+    l_open, r_open, ear, ipd = eye_metrics(lm, w, h)
     mar, corner_drop, inner, below, lower_y, mw, mh = mouth_boxes(frame, lm, w, h)
     ir, gap, ii = brow_signals(lm, w, h, ipd)
-    phil, nosew = nose_metrics(lm, w, h, ipd)
+    # nose metrics not needed for tongue/wink but kept for logs
+    Uphil, Unosew = 0.0, 0.0
+
     tongue_ok, tongue_score = has_tongue(inner, below, lower_y, mw, mh)
 
     if not calib.ready:
-        return "neutral", (mar, ear, gap, ir, ii, phil, nosew, tongue_score)
+        return "neutral", (mar, ear, gap, ir, ii, Uphil, Unosew, tongue_score, l_open, r_open)
 
     # relative gates
     mouth_open = mar > calib.MAR0 + MOUTH_OPEN_DELTA
@@ -251,23 +306,25 @@ def decide_state(frame, face, calib):
     eyes_wide  = ear > calib.EAR0 + EYES_WIDE_DELTA
     brows_up   = gap > calib.GAP0 + BROWS_UP_DELTA
 
-    # priority: shock > tongue > cry > neutral
+    # state priority: shock > tongue > cry > neutral
     if mouth_big and (brows_up or eyes_wide):
-        return "shock", (mar, ear, gap, ir, ii, phil, nosew, tongue_score)
+        return "shock", (mar, ear, gap, ir, ii, Uphil, Unosew, tongue_score, l_open, r_open)
 
-    # TONGUE: do not require big mouth; rely on protrusion below lip
     if tongue_ok and not (brows_up or eyes_wide):
-        return "tongue", (mar, ear, gap, ir, ii, phil, nosew, tongue_score)
+        return "tongue", (mar, ear, gap, ir, ii, Uphil, Unosew, tongue_score, l_open, r_open)
 
     if (corner_drop > CORNERS_DOWN_ABS) and (ir > calib.IR0 + 0.05) and not mouth_open:
-        return "cry", (mar, ear, gap, ir, ii, phil, nosew, tongue_score)
+        return "cry", (mar, ear, gap, ir, ii, Uphil, Unosew, tongue_score, l_open, r_open)
 
-    return "neutral", (mar, ear, gap, ir, ii, phil, nosew, tongue_score)
+    return "neutral", (mar, ear, gap, ir, ii, Uphil, Unosew, tongue_score, l_open, r_open)
 
 # ---------------- main loop ----------------
 def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    audio_init()
+
+    cam_idx = 0
+    cap = open_cam(cam_idx)
+    if cap is None:
         print("No camera found"); return
 
     cv2.namedWindow("Apple", cv2.WINDOW_NORMAL)
@@ -278,6 +335,9 @@ def main():
     print("Calibrating (~2s). Keep a relaxed neutral face...")
 
     log_ctr = 0
+    music_started = False
+    wink_cooldown = 0  # frames left
+
     while True:
         ok, frame = cap.read()
         if not ok: break
@@ -285,29 +345,51 @@ def main():
         out = FACE_MESH.process(rgb)
 
         next_state = "neutral"
+        l_open = r_open = 0.0
+
         if out.multi_face_landmarks:
             f = out.multi_face_landmarks[0]
             lm = f.landmark
+            l_open, r_open, ear, ipd = eye_metrics(lm, *frame.shape[1::-1])
+            mar, _, inner, below, lower_y, mw, mh = mouth_boxes(frame, lm, *frame.shape[1::-1])
+            ir, gap, ii = brow_signals(lm, *frame.shape[1::-1], ipd)
+
             if not calib.ready:
-                ear, ipd = eye_metrics(lm, *frame.shape[1::-1])
-                mar, _, _, _, _, _, _ = mouth_boxes(frame, lm, *frame.shape[1::-1])
-                ir, gap, ii = brow_signals(lm, *frame.shape[1::-1], ipd)
-                phil, nosew = nose_metrics(lm, *frame.shape[1::-1], ipd)
-                calib.push(mar, ear, gap, ir, ii, phil, nosew)
+                # push for calibration
+                calib.push(mar, l_open, r_open, ear, gap, ir, ii)
                 if time.time() - t0 > 2.0 and calib.finalize():
                     print("Calibration done.")
-            next_state, metrics = decide_state(frame, f, calib)
+                next_state = "neutral"
+            else:
+                next_state, metrics = decide_state(frame, f, calib)
+                # logging
+                log_ctr = (log_ctr + 1) % LOG_EVERY
+                if log_ctr == 0:
+                    mar_m, ear_m, gap_m, ir_m, ii_m, ph_m, nw_m, tscore, lo_m, ro_m = metrics
+                    print(f"STATE={next_state:7s} MAR={mar_m:.2f} EAR={ear_m:.2f} GAP={gap_m:.2f} "
+                          f"IR={ir_m:.2f} II={ii_m:.2f} LOPEN={lo_m:.2f} ROPEN={ro_m:.2f} TONGUE={tscore:.2f}")
 
-            # light logging to tune
-            log_ctr = (log_ctr + 1) % LOG_EVERY
-            if log_ctr == 0:
-                mar, ear, gap, ir, ii, ph, nw, tscore = metrics
-                print(f"STATE={next_state:7s} MAR={mar:.2f} EAR={ear:.2f} GAP={gap:.2f} "
-                      f"IR={ir:.2f} II={ii:.2f} PH={ph:.2f} NW={nw:.2f} TONGUE={tscore:.2f}")
+                # ---- wink detection -> start music (once) ----
+                if wink_cooldown > 0:
+                    wink_cooldown -= 1
+                else:
+                    left_closed  = l_open < calib.L0 * WINK_CLOSE_RATIO
+                    right_open   = r_open > calib.R0 * WINK_OPEN_RATIO
+                    right_closed = r_open < calib.R0 * WINK_CLOSE_RATIO
+                    left_open    = l_open > calib.L0 * WINK_OPEN_RATIO
+
+                    wink_now = (left_closed and right_open) or (right_closed and left_open)
+                    if wink_now:
+                        if not music_started:
+                            audio_play_once()
+                            music_started = True
+                            print("♫ Wink detected — music started.")
+                        wink_cooldown = WINK_COOLDOWN_FR
+
         else:
             next_state = "neutral"
 
-        # hysteresis
+        # hysteresis for apple sprite
         if next_state == state:
             stable = min(stable + 1, 12)
         else:
@@ -321,10 +403,29 @@ def main():
             cv2.imshow("Camera", frame)
 
         k = cv2.waitKey(1) & 0xFF
-        if k in (27, ord('q')): break
+        if k in (27, ord('q')):
+            break
         if k == ord('c'):
             calib, t0 = Calib(), time.time()
             print("Recalibrating: neutral face please...")
+        elif k == ord(']'):  # next camera
+            new_idx, new_cap = cycle_camera(cam_idx, +1)
+            if new_cap is not None:
+                cap.release()
+                cap = new_cap
+                cam_idx = new_idx
+                print(f"Switched camera to index {cam_idx}")
+            else:
+                print("No other camera found.")
+        elif k == ord('['):  # previous camera
+            new_idx, new_cap = cycle_camera(cam_idx, -1)
+            if new_cap is not None:
+                cap.release()
+                cap = new_cap
+                cam_idx = new_idx
+                print(f"Switched camera to index {cam_idx}")
+            else:
+                print("No other camera found.")
 
     cap.release(); cv2.destroyAllWindows()
 
