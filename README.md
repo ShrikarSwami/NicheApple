@@ -1,35 +1,16 @@
-# Apple Face States
+# NicheApple
 
-Apple Face States is a tiny OpenCV app that watches your face and flips a separate Apple window between five images:
+Face driven reactions with OpenCV and MediaPipe.  
+Shows an Apple face in a second window that reacts to your expressions.
 
-- neutral
-- tongue
-- shock
-- angry
-- cry
-
-The camera window stays clean with no drawings. The Apple window swaps PNGs based on simple mouth and eyebrow signals from MediaPipe Face Mesh.
-
-## Quick start
+## Setup
+python3.11 -m venv .venv311
+source .venv311/bin/activate
+pip install --upgrade pip
 pip install opencv-python mediapipe numpy
 
-assets/
-  apple_neutral.png
-  apple_tongue.png
-  apple_shock.png
-  apple_angry.png
-  apple_cry.png
-# each 1024x1024 PNG, framed the same
+## Run
+python apple_mouth_react.py
 
-python apple_face_states_clean.py
-
-Press q or Esc to quit.
-
-## Tuning
-Open mouth cutoff: 0.28
-Big open for shock: 0.40
-Tongue red ratio: 0.18
-Brow anger gap: 0.09
-Corner drop for cry: 0.22
-
-Raise or lower these in the script if your lighting or camera needs it.
+Press c to recalibrate  
+Press q to quit
